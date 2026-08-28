@@ -145,10 +145,10 @@ def already_traded_today() -> bool:
     return len(resp.json()) > 0
 
 
-def get_account_equity() -> float:
+def get_account_info() -> dict:
     resp = requests.get(f"{TRADING_BASE_URL}/v2/account", headers=HEADERS, timeout=10)
     resp.raise_for_status()
-    return float(resp.json()["equity"])
+    return resp.json()
 
 
 def place_bracket_order(direction: str, qty: int, stop: float, target: float) -> dict:
@@ -226,13 +226,44 @@ def check_and_trade():
     if stop_distance <= 0:
         log.warning("Zero-width stop distance - skipping.")
         return
+
+    # Guards against a delayed run (e.g. a missed cron trigger) acting on a
+    # breakout that's gone stale - if the current reference price has
+    # already moved past the fixed stop level, the stop is invalid before
+    # it's even submitted (Alpaca enforces stop_price vs. current price on
+    # bracket orders and rejects it - this is exactly what happened live on
+    # 2026-08-28, see project_orb_futures_strategy_findings memory). No
+    # order gets recorded on a local skip, so this re-checks - and can
+    # still fire - on every future run this session if price comes back to
+    # a level where the stop makes sense again; it doesn't burn today's
+    # one-attempt slot.
+    STOP_SANITY_BUFFER = 0.01  # matches Alpaca's own minimum stop-vs-price gap
+    if direction == "LONG" and entry_ref <= stop + STOP_SANITY_BUFFER:
+        log.warning("Stale breakout - price (%.2f) has fallen back through the stop (%.2f). Skipping, will "
+                     "recheck next run.", entry_ref, stop)
+        return
+    if direction == "SHORT" and entry_ref >= stop - STOP_SANITY_BUFFER:
+        log.warning("Stale breakout - price (%.2f) has risen back through the stop (%.2f). Skipping, will "
+                     "recheck next run.", entry_ref, stop)
+        return
+
     target = entry_ref + stop_distance * RR_RATIO if direction == "LONG" else entry_ref - stop_distance * RR_RATIO
 
-    equity = get_account_equity()
+    account = get_account_info()
+    equity = float(account["equity"])
+    buying_power = float(account["buying_power"])
     risk_amount = equity * RISK_PER_TRADE_PCT / 100
     qty = int(risk_amount / stop_distance)
+    # Risk-based sizing can call for more notional than the account can
+    # actually pay for (a tight stop on a high-priced instrument sizes up
+    # fast) - cap qty at what's affordable so it never gets rejected for
+    # insufficient buying power (this is what happened live on 2026-08-28).
+    # Only ever shrinks the position, never grows it beyond the 1%-risk size.
+    max_affordable_qty = int(buying_power / entry_ref)
+    qty = min(qty, max_affordable_qty)
     if qty <= 0:
-        log.warning("Computed qty <= 0 (risk_amount=%.2f stop_distance=%.4f) - skipping.", risk_amount, stop_distance)
+        log.warning("Computed qty <= 0 (risk_amount=%.2f stop_distance=%.4f buying_power=%.2f) - skipping.",
+                     risk_amount, stop_distance, buying_power)
         return
 
     log.info("%s breakout confirmed (range high=%.2f low=%.2f) - placing bracket: qty=%d stop=%.2f target=%.2f",
